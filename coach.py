@@ -1,16 +1,17 @@
 """Serverless handler for the Learnigence AI Product Coach front end.
 
-Deploy alongside the static page (e.g. Vercel `api/` directory). The browser
-posts to /api/coach; the Gemini key stays server-side in GEMINI_API_KEY.
+Place at api/coach.py in a Vercel project. Requires a root requirements.txt
+containing `google-genai`, and a GEMINI_API_KEY environment variable.
+The browser posts to /api/coach; the key never leaves the server.
 """
 
 import json
 import os
+import traceback
 from http.server import BaseHTTPRequestHandler
 
 from google import genai
-
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+from google.genai import types
 
 SYSTEM_INSTRUCTION = (
     "You are an entrepreneurship coach teaching users to build AI driven products. "
@@ -23,12 +24,7 @@ SYSTEM_INSTRUCTION = (
     "manage the cognitive load."
 )
 
-GENERATION_CONFIG = {
-    "temperature": 1,
-    "max_output_tokens": 65536,
-    "top_p": 0.95,
-    "thinking_level": "high",
-}
+FALLBACK_MODEL = "gemini-2.5-pro"
 
 
 def _flatten(contents):
@@ -42,21 +38,68 @@ def _flatten(contents):
     return "\n".join(lines)
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
+def _answer(client, model, prompt):
+    """Prefer the Interactions API; fall back to generate_content if the
+    installed SDK version does not expose it."""
+    if hasattr(client, "interactions"):
+        try:
+            interaction = client.interactions.create(
+                model=model,
+                input=prompt,
+                system_instruction=SYSTEM_INSTRUCTION,
+                generation_config={
+                    "temperature": 1,
+                    "max_output_tokens": 65536,
+                    "top_p": 0.95,
+                    "thinking_level": "high",
+                },
+            )
+            return interaction.output_text
+        except Exception:
+            pass
 
-        interaction = client.interactions.create(
-            model=body.get("model", "models/gemini-3.1-pro-preview"),
-            input=_flatten(body.get("contents")),
+    response = client.models.generate_content(
+        model=model.replace("models/", ""),
+        contents=prompt,
+        config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            generation_config=GENERATION_CONFIG,
-        )
+            temperature=1,
+            top_p=0.95,
+            max_output_tokens=8192,
+        ),
+    )
+    return response.text
 
-        payload = json.dumps({"outputText": interaction.output_text}).encode()
-        self.send_response(200)
+
+class handler(BaseHTTPRequestHandler):
+    def _send(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(payload)
+        self.wfile.write(body)
+
+    def do_POST(self):
+        key = os.environ.get("GEMINI_API_KEY")
+        if not key:
+            self._send(500, {"error": "GEMINI_API_KEY is not set on this deployment."})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            request = json.loads(self.rfile.read(length) or b"{}")
+            prompt = _flatten(request.get("contents"))
+            model = request.get("model", "models/gemini-3.1-pro-preview")
+
+            client = genai.Client(api_key=key)
+            try:
+                text = _answer(client, model, prompt)
+            except Exception:
+                # Requested model unavailable on this key — retry on a stable one.
+                text = _answer(client, FALLBACK_MODEL, prompt)
+
+            self._send(200, {"outputText": (text or "").strip()})
+        except Exception as exc:
+            print(traceback.format_exc())
+            self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
